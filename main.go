@@ -9,6 +9,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	appstypev1 "k8s.io/client-go/kubernetes/typed/apps/v1"
@@ -17,6 +18,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -33,20 +35,23 @@ var (
 	watchNamespaces   = flag.String("namespaces", "", "")
 )
 
+type objectKind interface {
+	metav1.Object
+	schema.ObjectKind
+}
+
 type watchApp interface {
 	Watch(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error)
 	Patch(annoKey, annoValue string) error
-	GetCron(object runtime.Object) (cronkey string, crontab string)
+	GetObject(object runtime.Object) objectKind
 }
 
 type deployment struct {
 	deploy appstypev1.DeploymentInterface
 }
 
-func (d deployment) GetCron(object runtime.Object) (cronkey string, crontab string) {
-	deploy := object.(*appsv1.Deployment)
-	cronkey = fmt.Sprintf("%s/%s/%s", deploy.Kind, deploy.Namespace, deploy.Name)
-	return cronkey, deploy.Annotations[crontabAnnotation]
+func (d deployment) GetObject(object runtime.Object) objectKind {
+	return object.(*appsv1.Deployment)
 }
 
 func (d deployment) Watch(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
@@ -117,6 +122,24 @@ func main() {
 	c := cron.New()
 	cronRecordMap := make(map[string]cronRecord)
 
+	validNamespace := (func() func(ns string) bool {
+		watchNs := strings.Split(*watchNamespaces, ",")
+
+		return func(ns string) bool {
+			if len(watchNs) == 0 {
+				return true
+			}
+
+			for _, _ns := range watchNs {
+				if ns == _ns {
+					return true
+				}
+			}
+
+			return false
+		}
+	})()
+
 	for event := range eventCh {
 		if event.Event.Type == watch.Error {
 			if status, ok := event.Object.(*metav1.Status); ok {
@@ -128,7 +151,13 @@ func main() {
 			continue
 		}
 
-		cronkey, crontab := event.wa.GetCron(event.Object)
+		obj := event.wa.GetObject(event.Object)
+		if !validNamespace(obj.GetNamespace()) {
+			continue
+		}
+
+		cronkey := fmt.Sprintf("%s/%s/%s", obj.GroupVersionKind().Kind, obj.GetNamespace(), obj.GetName())
+		crontab := obj.GetAnnotations()[crontabAnnotation]
 
 		var (
 			needDelete, needAdd bool
@@ -145,7 +174,9 @@ func main() {
 				needDelete = true
 			}
 
-			needAdd = true
+			if crontab != "" {
+				needAdd = true
+			}
 		case watch.Deleted:
 			needDelete = true
 		}
