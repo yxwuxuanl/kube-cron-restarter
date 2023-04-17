@@ -1,0 +1,5 @@
+github.com/robfig/cron/v3 v3.0.1 h1:WdRxkvbJztn8LMz/QEvLN5sBU+xKpSqwwUO1Pjr4qDs=
+github.com/robfig/cron/v3 v3.0.1/go.mod h1:eQICP3HwyT7UooqI/z+Ov+PtYAWygg1TEWWzGIFLtro=
+k8s.io/api v0.25.3/go.mod h1:o42gKscFrEVjHdQnyRenACrMtbuJsVdP+WVjqejfzmI=
+k8s.io/apimachinery v0.25.3/go.mod h1:jaF9C/iPNM1FuLl7Zuy5b9v+n35HGSh6AQ4HYRkCqwo=
+k8s.io/client-go v0.25.3/go.mod h1:t39LPczAIMwycjcXkVc+CB+PZV69jQuNx4um5ORDjQA=
