@@ -9,7 +9,9 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 go build . && chmod +x kube-cron-restarter
+ARG BUILD_LDFLAGS
+
+RUN CGO_ENABLED=0 go build -ldflags="$BUILD_LDFLAGS" . && chmod +x kube-cron-restarter
 
 FROM alpine:3.17
 
