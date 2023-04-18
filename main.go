@@ -8,14 +8,12 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
-	"k8s.io/client-go/kubernetes"
-	appstypev1 "k8s.io/client-go/kubernetes/typed/apps/v1"
+	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"log"
+	"k8s.io/klog/v2"
 	"os"
 	"os/signal"
 	"strings"
@@ -35,95 +33,64 @@ var (
 	watchNamespaces   = flag.String("namespaces", "", "")
 )
 
-type objectKind interface {
-	metav1.Object
-	schema.ObjectKind
+type objectEvent struct {
+	obj metav1.Object
+	e   watch.Event
 }
 
-type watchApp interface {
-	Watch(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error)
-	Patch(annoKey, annoValue string) error
-	GetObject(object runtime.Object) objectKind
-}
-
-type deployment struct {
-	deploy appstypev1.DeploymentInterface
-}
-
-func (d deployment) GetObject(object runtime.Object) objectKind {
-	return object.(*appsv1.Deployment)
-}
-
-func (d deployment) Watch(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
-	return d.deploy.Watch(ctx, opts)
-}
-
-func (d deployment) Patch(annoKey, annoValue string) error {
-	//TODO implement me
-	panic("implement me")
-}
-
-type appEvent struct {
-	wa watchApp
-	watch.Event
-}
-
-type cronRecord struct {
+type cronEntry struct {
 	entryID cron.EntryID
 	crontab string
 }
 
+var resourcesMap = map[string]string{}
+
 func main() {
-	log.Default().SetFlags(log.LstdFlags | log.Lshortfile)
-
-	kc, err := makeKubeClient()
-	if err != nil {
-		log.Fatalf("make kube client error: %s", err)
-	}
-
 	flag.Parse()
+
+	appsV1Client, err := makeAppsV1Client()
+	if err != nil {
+		klog.Fatalf("makeAppsV1Client error: %s", err)
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	eventCh := make(chan appEvent, 20)
+	eventCh := make(chan objectEvent, 20)
 
-	addApp := func(wa watchApp) error {
-		w, err := wa.Watch(context.Background(), metav1.ListOptions{})
-		if err != nil {
-			return err
-		}
-
-		go func() {
-			for event := range w.ResultChan() {
-				eventCh <- appEvent{
-					Event: event,
-					wa:    wa,
-				}
-			}
-		}()
-
-		<-ctx.Done()
-		w.Stop()
-
-		return nil
+	if *enableDeployment {
+		go watchResource(ctx, appsV1Client, "deployments", &appsv1.Deployment{}, eventCh)
 	}
 
 	if *enableDaemonset {
-		err := addApp(deployment{
-			deploy: kc.AppsV1().Deployments(corev1.NamespaceAll),
-		})
+		go watchResource(ctx, appsV1Client, "daemonsets", &appsv1.DaemonSet{}, eventCh)
+	}
 
-		if err != nil {
-			log.Printf("watch deployment error: %s", err)
-		}
+	if *enableStatefulset {
+		go watchResource(ctx, appsV1Client, "statefulsets", &appsv1.StatefulSet{}, eventCh)
 	}
 
 	c := cron.New()
-	cronRecordMap := make(map[string]cronRecord)
+	go handleEvent(eventCh, c, appsV1Client)
+	c.Start()
+
+	<-ctx.Done()
+	close(eventCh)
+
+	<-c.Stop().Done()
+}
+
+func handleEvent(ch chan objectEvent, c *cron.Cron, rc rest.Interface) {
+	cronjobs := make(map[string]cronEntry)
 
 	validNamespace := (func() func(ns string) bool {
-		watchNs := strings.Split(*watchNamespaces, ",")
+		var watchNs []string
+
+		if *watchNamespaces == "" {
+			klog.Info("watch all namespaces")
+		} else {
+			watchNs = strings.Split(*watchNamespaces, ",")
+		}
 
 		return func(ns string) bool {
 			if len(watchNs) == 0 {
@@ -140,34 +107,30 @@ func main() {
 		}
 	})()
 
-	for event := range eventCh {
-		if event.Event.Type == watch.Error {
-			if status, ok := event.Object.(*metav1.Status); ok {
-				log.Printf("watch %s error: %s", status.Kind, status.Message)
-			} else {
-				log.Printf("watch error: unknown error")
-			}
+	for event := range ch {
+		ns := event.obj.GetNamespace()
 
+		if !validNamespace(ns) {
 			continue
 		}
 
-		obj := event.wa.GetObject(event.Object)
-		if !validNamespace(obj.GetNamespace()) {
-			continue
-		}
+		name := event.obj.GetName()
+		objType := fmt.Sprintf("%T", event.obj)
 
-		cronkey := fmt.Sprintf("%s/%s/%s", obj.GroupVersionKind().Kind, obj.GetNamespace(), obj.GetName())
-		crontab := obj.GetAnnotations()[crontabAnnotation]
+		cronkey := fmt.Sprintf("%s/%s/%s", objType, ns, name)
+		crontab := event.obj.GetAnnotations()[crontabAnnotation]
 
 		var (
 			needDelete, needAdd bool
 		)
 
-		switch event.Event.Type {
+		switch event.e.Type {
 		case watch.Added:
-			needAdd = true
+			if crontab != "" {
+				needAdd = true
+			}
 		case watch.Modified:
-			if rec, ok := cronRecordMap[cronkey]; ok {
+			if rec, ok := cronjobs[cronkey]; ok {
 				if rec.crontab == crontab {
 					continue
 				}
@@ -182,35 +145,109 @@ func main() {
 		}
 
 		if needDelete {
-			if rec, ok := cronRecordMap[cronkey]; ok {
+			if rec, ok := cronjobs[cronkey]; ok {
 				c.Remove(rec.entryID)
-				delete(cronRecordMap, cronkey)
+				delete(cronjobs, cronkey)
+				klog.InfoS("delete cronjob", "kind", objType, "ns", ns, "name", name)
 			}
 		}
 
 		if needAdd {
 			entryID, err := c.AddFunc(crontab, func() {
-				err := event.wa.Patch(restartedAnnotation, time.Now().Format(time.RFC3339))
-				if err != nil {
-					log.Printf("run %s error: %s", cronkey, err)
+				patch := buildPodTemplateAnnotationsPatch(restartedAnnotation, time.Now().Format(time.RFC3339))
+				if err := patchObject(rc, resourcesMap[objType], ns, name, patch); err != nil {
+					klog.ErrorS(err, "patch error", "kind", objType, "ns", ns, "name", name)
+				} else {
+					klog.InfoS("patch succeeded", "kind", objType, "ns", ns, "name", name)
 				}
 			})
 
 			if err != nil {
-				log.Printf("add cronjob error: %s", err)
+				klog.ErrorS(err, "add cronjob error", "kind", objType, "ns", ns, "name", name, "crontab", crontab)
 			} else {
-				cronRecordMap[cronkey] = cronRecord{
+				cronjobs[cronkey] = cronEntry{
 					entryID: entryID,
 					crontab: crontab,
 				}
+
+				klog.InfoS("add cronjob", "kind", objType, "ns", ns, "name", name, "crontab", crontab)
 			}
 		}
 	}
-
 }
 
-func makeKubeClient() (*kubernetes.Clientset, error) {
-	kc, err := rest.InClusterConfig()
+func patchObject(rc rest.Interface, resource, ns, name string, patch []byte) error {
+	return rc.Patch(types.MergePatchType).
+		Resource(resource).
+		Namespace(ns).
+		Name(name).
+		Body(patch).
+		VersionedParams(&metav1.PatchOptions{}, scheme.ParameterCodec).
+		Do(context.Background()).
+		Error()
+}
+
+func buildPodTemplateAnnotationsPatch(key, value string) []byte {
+	patch := fmt.Sprintf(`
+		{
+			"spec": {
+				"template": {
+					"metadata": {
+						"annotations": {
+							"%s":"%s"
+						}
+					}
+				}
+			}
+		}`, key, value)
+
+	return []byte(patch)
+}
+
+func watchResource[T metav1.Object](ctx context.Context, client rest.Interface, resource string, sampleObj T, ch chan objectEvent) {
+	w, err := client.Get().
+		Namespace(corev1.NamespaceAll).
+		Resource(resource).
+		VersionedParams(&metav1.ListOptions{
+			Watch: true,
+		}, scheme.ParameterCodec).
+		Watch(ctx)
+
+	if err != nil {
+		klog.Errorf("watch %s error: %s", resource, err)
+		return
+	}
+
+	resourcesMap[fmt.Sprintf("%T", sampleObj)] = resource
+
+	go func() {
+		<-ctx.Done()
+		w.Stop()
+	}()
+
+	for event := range w.ResultChan() {
+		if event.Type == watch.Error {
+			if v, ok := event.Object.(*metav1.Status); ok {
+				klog.Errorf("watch %s error: %s: %s", resource, v.Reason, v.Message)
+			} else {
+				klog.Errorf("watch %s error", resource)
+			}
+			continue
+		}
+
+		if obj, ok := event.Object.(T); ok {
+			ch <- objectEvent{
+				obj: obj,
+				e:   event,
+			}
+		} else {
+			klog.Errorf("cast event object to %T failed", *(new(T)))
+		}
+	}
+}
+
+func makeAppsV1Client() (rest.Interface, error) {
+	config, err := rest.InClusterConfig()
 
 	if err != nil {
 		kubeconfPath := os.Getenv("KUBECONFIG")
@@ -218,13 +255,22 @@ func makeKubeClient() (*kubernetes.Clientset, error) {
 			kubeconfPath = os.Getenv("HOME") + "/.kube/config"
 		}
 		if err == rest.ErrNotInCluster {
-			kc, err = clientcmd.BuildConfigFromFlags("", kubeconfPath)
+			config, err = clientcmd.BuildConfigFromFlags("", kubeconfPath)
 		}
 	}
 
-	if kc == nil {
+	if config == nil {
 		return nil, err
 	}
 
-	return kubernetes.NewForConfig(kc)
+	gv := appsv1.SchemeGroupVersion
+	config.GroupVersion = &gv
+	config.APIPath = "/apis"
+	config.NegotiatedSerializer = scheme.Codecs.WithoutConversion()
+
+	if config.UserAgent == "" {
+		config.UserAgent = rest.DefaultKubernetesUserAgent()
+	}
+
+	return rest.RESTClientFor(config)
 }
