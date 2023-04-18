@@ -21,16 +21,14 @@ import (
 	"time"
 )
 
-var (
-	crontabAnnotation   = "cron-restarter/cron"
-	restartedAnnotation = "cron-restarter/restartedAt"
-)
+const restartedAnnotation = "cron-restarter/restartedAt"
 
 var (
-	enableDeployment  = flag.Bool("deployment", true, "")
-	enableDaemonset   = flag.Bool("daemonset", false, "")
-	enableStatefulset = flag.Bool("statefulset", false, "")
-	watchNamespaces   = flag.String("namespaces", "", "")
+	enableDeployment       = flag.Bool("deployment", true, "")
+	enableDaemonset        = flag.Bool("daemonset", false, "")
+	enableStatefulset      = flag.Bool("statefulset", false, "")
+	cronScheduleAnnotation = flag.String("schedule-annotation", "cron-restarter/schedule", "")
+	watchNamespaces        = flag.String("namespaces", "", "")
 )
 
 type objectEvent struct {
@@ -38,14 +36,15 @@ type objectEvent struct {
 	e   watch.Event
 }
 
-type cronEntry struct {
-	entryID cron.EntryID
-	crontab string
+type cronjob struct {
+	entryID  cron.EntryID
+	schedule string
 }
 
 var resourcesMap = map[string]string{}
 
 func main() {
+	klog.InitFlags(flag.CommandLine)
 	flag.Parse()
 
 	appsV1Client, err := makeAppsV1Client()
@@ -81,7 +80,7 @@ func main() {
 }
 
 func handleEvent(ch chan objectEvent, c *cron.Cron, rc rest.Interface) {
-	cronjobs := make(map[string]cronEntry)
+	cronjobs := make(map[string]cronjob)
 
 	validNamespace := (func() func(ns string) bool {
 		var watchNs []string
@@ -118,7 +117,7 @@ func handleEvent(ch chan objectEvent, c *cron.Cron, rc rest.Interface) {
 		objType := fmt.Sprintf("%T", event.obj)
 
 		cronkey := fmt.Sprintf("%s/%s/%s", objType, ns, name)
-		crontab := event.obj.GetAnnotations()[crontabAnnotation]
+		schedule := event.obj.GetAnnotations()[*cronScheduleAnnotation]
 
 		var (
 			needDelete, needAdd bool
@@ -126,18 +125,18 @@ func handleEvent(ch chan objectEvent, c *cron.Cron, rc rest.Interface) {
 
 		switch event.e.Type {
 		case watch.Added:
-			if crontab != "" {
+			if schedule != "" {
 				needAdd = true
 			}
 		case watch.Modified:
 			if rec, ok := cronjobs[cronkey]; ok {
-				if rec.crontab == crontab {
+				if rec.schedule == schedule {
 					continue
 				}
 				needDelete = true
 			}
 
-			if crontab != "" {
+			if schedule != "" {
 				needAdd = true
 			}
 		case watch.Deleted:
@@ -153,7 +152,7 @@ func handleEvent(ch chan objectEvent, c *cron.Cron, rc rest.Interface) {
 		}
 
 		if needAdd {
-			entryID, err := c.AddFunc(crontab, func() {
+			entryID, err := c.AddFunc(schedule, func() {
 				patch := buildPodTemplateAnnotationsPatch(restartedAnnotation, time.Now().Format(time.RFC3339))
 				if err := patchObject(rc, resourcesMap[objType], ns, name, patch); err != nil {
 					klog.ErrorS(err, "patch error", "kind", objType, "ns", ns, "name", name)
@@ -163,14 +162,14 @@ func handleEvent(ch chan objectEvent, c *cron.Cron, rc rest.Interface) {
 			})
 
 			if err != nil {
-				klog.ErrorS(err, "add cronjob error", "kind", objType, "ns", ns, "name", name, "crontab", crontab)
+				klog.ErrorS(err, "add cronjob error", "kind", objType, "ns", ns, "name", name, "schedule", schedule)
 			} else {
-				cronjobs[cronkey] = cronEntry{
-					entryID: entryID,
-					crontab: crontab,
+				cronjobs[cronkey] = cronjob{
+					entryID:  entryID,
+					schedule: schedule,
 				}
 
-				klog.InfoS("add cronjob", "kind", objType, "ns", ns, "name", name, "crontab", crontab)
+				klog.InfoS("add cronjob", "kind", objType, "ns", ns, "name", name, "schedule", schedule)
 			}
 		}
 	}
@@ -205,43 +204,60 @@ func buildPodTemplateAnnotationsPatch(key, value string) []byte {
 }
 
 func watchResource[T metav1.Object](ctx context.Context, client rest.Interface, resource string, sampleObj T, ch chan objectEvent) {
-	w, err := client.Get().
-		Namespace(corev1.NamespaceAll).
-		Resource(resource).
-		VersionedParams(&metav1.ListOptions{
-			Watch: true,
-		}, scheme.ParameterCodec).
-		Watch(ctx)
-
-	if err != nil {
-		klog.Errorf("watch %s error: %s", resource, err)
-		return
-	}
-
 	resourcesMap[fmt.Sprintf("%T", sampleObj)] = resource
+
+	var (
+		watcher watch.Interface
+		err     error
+		done    bool
+	)
+
+	opts := &metav1.ListOptions{Watch: true}
 
 	go func() {
 		<-ctx.Done()
-		w.Stop()
+		done = true
+
+		if watcher != nil {
+			watcher.Stop()
+		}
 	}()
 
-	for event := range w.ResultChan() {
-		if event.Type == watch.Error {
-			if v, ok := event.Object.(*metav1.Status); ok {
-				klog.Errorf("watch %s error: %s: %s", resource, v.Reason, v.Message)
-			} else {
-				klog.Errorf("watch %s error", resource)
-			}
+	for {
+		watcher, err = client.Get().
+			Namespace(corev1.NamespaceAll).
+			Resource(resource).
+			VersionedParams(opts, scheme.ParameterCodec).
+			Watch(ctx)
+
+		if err != nil {
+			klog.Errorf("watch %s error: %s", resource, err)
+			time.Sleep(time.Second * 5)
 			continue
 		}
 
-		if obj, ok := event.Object.(T); ok {
-			ch <- objectEvent{
-				obj: obj,
-				e:   event,
+		for event := range watcher.ResultChan() {
+			if event.Type == watch.Error {
+				if v, ok := event.Object.(*metav1.Status); ok {
+					klog.Errorf("watch %s error: %s: %s", resource, v.Reason, v.Message)
+				} else {
+					klog.Errorf("watch %s error", resource)
+				}
+				continue
 			}
-		} else {
-			klog.Errorf("cast event object to %T failed", *(new(T)))
+
+			if obj, ok := event.Object.(T); ok {
+				ch <- objectEvent{
+					obj: obj,
+					e:   event,
+				}
+			} else {
+				klog.Errorf("cast event object to %T failed", *(new(T)))
+			}
+		}
+
+		if done {
+			return
 		}
 	}
 }

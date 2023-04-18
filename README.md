@@ -16,7 +16,7 @@ To use kube-cron-restarter, you need to add the following annotations to your Ku
 
 ```yaml
 annotations:
-    cron-restarter/cron: "0 3 * * *"
+    cron-restarter/schedule: "0 3 * * *"
 ```
 
 ### Configuration
