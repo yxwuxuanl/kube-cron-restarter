@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    app: {{ .Release.Name }}
+spec:
+  replicas: 1
+  template:
+    metadata:
+      name: {{ .Release.Name }}
+      labels:
+        app: {{ .Release.Name }}
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: {{ .Release.Name }}
+          image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+          imagePullPolicy: IfNotPresent
+          env:
+            {{- range $name, $value := .Values.restarter.env }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+            {{- end }}
+          args:
+            - --deployment={{ toString .Values.restarter.deployment }}
+            - --statefulset={{ toString .Values.restarter.statefulset}}
+            - --daemonset={{ toString .Values.restarter.daemonset }}
+            {{- with .Values.restarter.namespaces }}
+            - --namespaces={{ . | join "," }}
+            {{- end }}
+          securityContext:
+            capabilities:
+              drop:
+                - ALL
+            runAsNonRoot: true
+            runAsUser: 3000
+            runAsGroup: 3000
+      restartPolicy: Always
+      serviceAccountName: {{ .Release.Name }}
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}
