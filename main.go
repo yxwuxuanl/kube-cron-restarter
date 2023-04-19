@@ -8,10 +8,14 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 	"os"
@@ -31,46 +35,75 @@ var (
 	watchNamespaces        = flag.String("namespaces", "", "")
 )
 
-type objectEvent struct {
-	obj metav1.Object
-	e   watch.Event
+type Object interface {
+	runtime.Object
+	metav1.Object
 }
 
-type cronjob struct {
+type Event struct {
+	obj   Object
+	event watch.EventType
+}
+
+type Cronjob struct {
 	entryID  cron.EntryID
 	schedule string
 }
 
 var resourcesMap = map[string]string{}
 
+var validNamespace func(ns string) bool
+
 func main() {
 	klog.InitFlags(flag.CommandLine)
+
+	kc, err := makeKubeClient()
+	if err != nil {
+		klog.Fatalf("make kube client error: %s", err)
+	}
+
 	flag.Parse()
 
-	appsV1Client, err := makeAppsV1Client()
-	if err != nil {
-		klog.Fatalf("makeAppsV1Client error: %s", err)
+	var watchNs []string
+	if *watchNamespaces != "" {
+		watchNs = strings.Split(*watchNamespaces, ",")
+	}
+
+	validNamespace = func(ns string) bool {
+		if len(watchNs) == 0 {
+			return true
+		}
+
+		for _, _ns := range watchNs {
+			if _ns == ns {
+				return true
+			}
+		}
+
+		return false
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	eventCh := make(chan objectEvent, 20)
+	eventCh := make(chan Event, 20)
+
+	appsv1Client := kc.AppsV1().RESTClient()
 
 	if *enableDeployment {
-		go watchResource(ctx, appsV1Client, "deployments", &appsv1.Deployment{}, eventCh)
+		go watchResource(ctx, appsv1Client, "deployments", &appsv1.Deployment{}, eventCh)
 	}
 
 	if *enableDaemonset {
-		go watchResource(ctx, appsV1Client, "daemonsets", &appsv1.DaemonSet{}, eventCh)
+		go watchResource(ctx, appsv1Client, "daemonsets", &appsv1.DaemonSet{}, eventCh)
 	}
 
 	if *enableStatefulset {
-		go watchResource(ctx, appsV1Client, "statefulsets", &appsv1.StatefulSet{}, eventCh)
+		go watchResource(ctx, appsv1Client, "statefulsets", &appsv1.StatefulSet{}, eventCh)
 	}
 
 	c := cron.New()
-	go handleEvent(eventCh, c, appsV1Client)
+	go handleEvent(eventCh, c, appsv1Client)
 	c.Start()
 
 	<-ctx.Done()
@@ -79,55 +112,83 @@ func main() {
 	<-c.Stop().Done()
 }
 
-func handleEvent(ch chan objectEvent, c *cron.Cron, rc rest.Interface) {
-	cronjobs := make(map[string]cronjob)
+func watchResource[T Object](
+	ctx context.Context,
+	client rest.Interface,
+	resource string,
+	sampleObj T,
+	ch chan Event,
+) {
+	listWatcher := cache.NewListWatchFromClient(client, resource, corev1.NamespaceAll, fields.Everything())
 
-	validNamespace := (func() func(ns string) bool {
-		var watchNs []string
+	_, informer := cache.NewIndexerInformer(listWatcher, sampleObj, 0, cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			if o, ok := obj.(T); ok {
+				if !validNamespace(o.GetNamespace()) || getSchedule(o) == "" {
+					return
+				}
 
-		if *watchNamespaces == "" {
-			klog.Info("watch all namespaces")
-		} else {
-			watchNs = strings.Split(*watchNamespaces, ",")
-		}
-
-		return func(ns string) bool {
-			if len(watchNs) == 0 {
-				return true
-			}
-
-			for _, _ns := range watchNs {
-				if ns == _ns {
-					return true
+				ch <- Event{
+					obj:   o,
+					event: watch.Added,
 				}
 			}
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			if o, ok := newObj.(T); ok {
+				if !validNamespace(o.GetNamespace()) {
+					return
+				}
 
-			return false
-		}
-	})()
+				if getSchedule(o) == "" {
+					if oo, ok := oldObj.(T); ok && getSchedule(oo) == "" {
+						return
+					}
+				}
+
+				ch <- Event{
+					obj:   o,
+					event: watch.Modified,
+				}
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
+			if o, ok := obj.(T); ok {
+				if !validNamespace(o.GetNamespace()) || getSchedule(o) == "" {
+					return
+				}
+
+				ch <- Event{
+					obj:   o,
+					event: watch.Deleted,
+				}
+			}
+		},
+	}, cache.Indexers{})
+
+	resourcesMap[typeOf(sampleObj)] = resource
+	informer.Run(ctx.Done())
+}
+
+func handleEvent(ch chan Event, c *cron.Cron, rc rest.Interface) {
+	cronjobs := make(map[string]Cronjob)
 
 	for event := range ch {
 		ns := event.obj.GetNamespace()
 
-		if !validNamespace(ns) {
-			continue
-		}
-
 		name := event.obj.GetName()
-		objType := fmt.Sprintf("%T", event.obj)
+		objType := typeOf(event.obj)
 
 		cronkey := fmt.Sprintf("%s/%s/%s", objType, ns, name)
-		schedule := event.obj.GetAnnotations()[*cronScheduleAnnotation]
+		schedule := getSchedule(event.obj)
 
 		var (
 			needDelete, needAdd bool
 		)
 
-		switch event.e.Type {
+		switch event.event {
 		case watch.Added:
-			if schedule != "" {
-				needAdd = true
-			}
+			needAdd = true
 		case watch.Modified:
 			if rec, ok := cronjobs[cronkey]; ok {
 				if rec.schedule == schedule {
@@ -152,6 +213,12 @@ func handleEvent(ch chan objectEvent, c *cron.Cron, rc rest.Interface) {
 		}
 
 		if needAdd {
+			if rec, ok := cronjobs[cronkey]; ok {
+				if rec.schedule == schedule {
+					continue
+				}
+			}
+
 			entryID, err := c.AddFunc(schedule, func() {
 				patch := buildPodTemplateAnnotationsPatch(restartedAnnotation, time.Now().Format(time.RFC3339))
 				if err := patchObject(rc, resourcesMap[objType], ns, name, patch); err != nil {
@@ -164,7 +231,7 @@ func handleEvent(ch chan objectEvent, c *cron.Cron, rc rest.Interface) {
 			if err != nil {
 				klog.ErrorS(err, "add cronjob error", "kind", objType, "ns", ns, "name", name, "schedule", schedule)
 			} else {
-				cronjobs[cronkey] = cronjob{
+				cronjobs[cronkey] = Cronjob{
 					entryID:  entryID,
 					schedule: schedule,
 				}
@@ -173,6 +240,30 @@ func handleEvent(ch chan objectEvent, c *cron.Cron, rc rest.Interface) {
 			}
 		}
 	}
+}
+
+func makeKubeClient() (kubernetes.Interface, error) {
+	config, err := rest.InClusterConfig()
+
+	if err != nil {
+		kubeconfPath := os.Getenv("KUBECONFIG")
+		if kubeconfPath == "" {
+			kubeconfPath = os.Getenv("HOME") + "/.kube/config"
+		}
+		if err == rest.ErrNotInCluster {
+			config, err = clientcmd.BuildConfigFromFlags("", kubeconfPath)
+		}
+	}
+
+	if config == nil {
+		return nil, err
+	}
+
+	return kubernetes.NewForConfig(config)
+}
+
+func typeOf(o any) string {
+	return fmt.Sprintf("%T", o)
 }
 
 func patchObject(rc rest.Interface, resource, ns, name string, patch []byte) error {
@@ -203,90 +294,6 @@ func buildPodTemplateAnnotationsPatch(key, value string) []byte {
 	return []byte(patch)
 }
 
-func watchResource[T metav1.Object](ctx context.Context, client rest.Interface, resource string, sampleObj T, ch chan objectEvent) {
-	resourcesMap[fmt.Sprintf("%T", sampleObj)] = resource
-
-	var (
-		watcher watch.Interface
-		err     error
-		done    bool
-	)
-
-	opts := &metav1.ListOptions{Watch: true}
-
-	go func() {
-		<-ctx.Done()
-		done = true
-
-		if watcher != nil {
-			watcher.Stop()
-		}
-	}()
-
-	for {
-		watcher, err = client.Get().
-			Namespace(corev1.NamespaceAll).
-			Resource(resource).
-			VersionedParams(opts, scheme.ParameterCodec).
-			Watch(ctx)
-
-		if err != nil {
-			klog.Errorf("watch %s error: %s", resource, err)
-			time.Sleep(time.Second * 5)
-			continue
-		}
-
-		for event := range watcher.ResultChan() {
-			if event.Type == watch.Error {
-				if v, ok := event.Object.(*metav1.Status); ok {
-					klog.Errorf("watch %s error: %s: %s", resource, v.Reason, v.Message)
-				} else {
-					klog.Errorf("watch %s error", resource)
-				}
-				continue
-			}
-
-			if obj, ok := event.Object.(T); ok {
-				ch <- objectEvent{
-					obj: obj,
-					e:   event,
-				}
-			} else {
-				klog.Errorf("cast event object to %T failed", *(new(T)))
-			}
-		}
-
-		if done {
-			return
-		}
-	}
-}
-
-func makeAppsV1Client() (rest.Interface, error) {
-	config, err := rest.InClusterConfig()
-
-	if err != nil {
-		kubeconfPath := os.Getenv("KUBECONFIG")
-		if kubeconfPath == "" {
-			kubeconfPath = os.Getenv("HOME") + "/.kube/config"
-		}
-		if err == rest.ErrNotInCluster {
-			config, err = clientcmd.BuildConfigFromFlags("", kubeconfPath)
-		}
-	}
-
-	if config == nil {
-		return nil, err
-	}
-
-	gv := appsv1.SchemeGroupVersion
-	config.GroupVersion = &gv
-	config.APIPath = "/apis"
-	config.NegotiatedSerializer = scheme.Codecs.WithoutConversion()
-
-	if config.UserAgent == "" {
-		config.UserAgent = rest.DefaultKubernetesUserAgent()
-	}
-
-	return rest.RESTClientFor(config)
+func getSchedule(o Object) string {
+	return o.GetAnnotations()[*cronScheduleAnnotation]
 }
