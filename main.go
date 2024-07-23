@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"github.com/robfig/cron/v3"
@@ -17,6 +16,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/homedir"
 	"k8s.io/klog/v2"
 	"os"
 	"os/signal"
@@ -26,26 +26,17 @@ import (
 )
 
 var (
-	enableDeployment  = flag.Bool("deployments", true, "")
-	enableDaemonset   = flag.Bool("daemonsets", false, "")
-	enableStatefulset = flag.Bool("statefulsets", false, "")
-
-	cronScheduleAnnotation = flag.String("schedule-annotation", "cron-restarter/schedule", "")
+	enableDeployment   = flag.Bool("deployments", true, "")
+	enableDaemonset    = flag.Bool("daemonsets", true, "")
+	enableStatefulset  = flag.Bool("statefulsets", true, "")
+	kubeconfig         = flag.String("kubeconfig", path.Join(homedir.HomeDir(), ".kube", "config"), "")
+	scheduleAnnotation = flag.String("schedule-annotation", "cron-restarter/schedule", "")
 )
 
 func main() {
 	flag.Parse()
 
-	kconfig, err := rest.InClusterConfig()
-	if err != nil {
-		if errors.Is(err, rest.ErrNotInCluster) {
-			kconfig, err = clientcmd.BuildConfigFromFlags(
-				"",
-				path.Join(os.Getenv("HOME"), ".kube/config"),
-			)
-		}
-	}
-
+	kconfig, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
 	if err != nil {
 		panic(err)
 	}
@@ -71,6 +62,8 @@ func main() {
 	}
 
 	<-ctx.Done()
+	klog.Info("shutdown...")
+
 	<-c.Stop().Done()
 }
 
@@ -185,7 +178,7 @@ func getObjectKey(object metav1.Object) string {
 
 func getSchedule(object metav1.Object) string {
 	if annos := object.GetAnnotations(); annos != nil {
-		return annos[*cronScheduleAnnotation]
+		return annos[*scheduleAnnotation]
 	}
 
 	return ""
