@@ -1,0 +1,16 @@
+image:
+  repository: ghcr.io/yxwuxuanl/kube-cron-restarter
+  tag: main
+  imagePullPolicy: Always
+
+deployment: true
+
+daemonset: true
+
+statefulset: true
+
+nodeSelector: { }
+
+tolerations: [ ]
+
+timezone: Asia/Shanghai

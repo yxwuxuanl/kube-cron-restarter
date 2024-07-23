@@ -13,22 +13,26 @@ spec:
         app: {{ .Release.Name }}
     spec:
       enableServiceLinks: false
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: {{ .Release.Name }}
           image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: {{ .Values.image.imagePullPolicy }}
           env:
-            {{- range $name, $value := .Values.restarter.env }}
-            - name: {{ $name }}
-              value: {{ $value | quote }}
-            {{- end }}
+            - name: TZ
+              value: {{ .Values.timezone }}
           args:
-            - --deployment={{ toString .Values.restarter.deployment }}
-            - --statefulset={{ toString .Values.restarter.statefulset}}
-            - --daemonset={{ toString .Values.restarter.daemonset }}
-            {{- with .Values.restarter.namespaces }}
-            - --namespaces={{ . | join "," }}
-            {{- end }}
+            - --deployments={{ toString .Values.deployment }}
+            - --statefulsets={{ toString .Values.statefulset}}
+            - --daemonsets={{ toString .Values.daemonset }}
+            - --kubeconfig=
           securityContext:
             capabilities:
               drop:
