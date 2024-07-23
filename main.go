@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"github.com/robfig/cron/v3"
@@ -11,7 +12,6 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -20,280 +20,173 @@ import (
 	"k8s.io/klog/v2"
 	"os"
 	"os/signal"
-	"strings"
+	"path"
 	"syscall"
 	"time"
 )
 
-const restartedAnnotation = "cron-restarter/restartedAt"
-
 var (
-	enableDeployment       = flag.Bool("deployment", true, "")
-	enableDaemonset        = flag.Bool("daemonset", false, "")
-	enableStatefulset      = flag.Bool("statefulset", false, "")
+	enableDeployment  = flag.Bool("deployments", true, "")
+	enableDaemonset   = flag.Bool("daemonsets", false, "")
+	enableStatefulset = flag.Bool("statefulsets", false, "")
+
 	cronScheduleAnnotation = flag.String("schedule-annotation", "cron-restarter/schedule", "")
-	watchNamespaces        = flag.String("namespaces", "", "")
 )
 
-type Object interface {
-	runtime.Object
-	metav1.Object
-}
-
-type Event struct {
-	obj   Object
-	event watch.EventType
-}
-
-type Cronjob struct {
-	entryID  cron.EntryID
-	schedule string
-}
-
-var resourcesMap = map[string]string{}
-
-var validNamespace func(ns string) bool
-
 func main() {
-	klog.InitFlags(flag.CommandLine)
-
-	kc, err := makeKubeClient()
-	if err != nil {
-		klog.Fatalf("make kube client error: %s", err)
-	}
-
 	flag.Parse()
 
-	var watchNs []string
-	if *watchNamespaces != "" {
-		watchNs = strings.Split(*watchNamespaces, ",")
+	kconfig, err := rest.InClusterConfig()
+	if err != nil {
+		if errors.Is(err, rest.ErrNotInCluster) {
+			kconfig, err = clientcmd.BuildConfigFromFlags(
+				"",
+				path.Join(os.Getenv("HOME"), ".kube/config"),
+			)
+		}
 	}
 
-	validNamespace = func(ns string) bool {
-		if len(watchNs) == 0 {
-			return true
-		}
-
-		for _, _ns := range watchNs {
-			if _ns == ns {
-				return true
-			}
-		}
-
-		return false
+	if err != nil {
+		panic(err)
 	}
+
+	clientset := kubernetes.NewForConfigOrDie(kconfig)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	eventCh := make(chan Event, 20)
-
-	appsv1Client := kc.AppsV1().RESTClient()
+	c := cron.New()
+	c.Start()
 
 	if *enableDeployment {
-		go watchResource(ctx, appsv1Client, "deployments", &appsv1.Deployment{}, eventCh)
-	}
-
-	if *enableDaemonset {
-		go watchResource(ctx, appsv1Client, "daemonsets", &appsv1.DaemonSet{}, eventCh)
+		go watch(ctx, clientset.AppsV1().RESTClient(), "deployments", &appsv1.Deployment{}, c)
 	}
 
 	if *enableStatefulset {
-		go watchResource(ctx, appsv1Client, "statefulsets", &appsv1.StatefulSet{}, eventCh)
+		go watch(ctx, clientset.AppsV1().RESTClient(), "statefulsets", &appsv1.StatefulSet{}, c)
 	}
 
-	c := cron.New()
-	go handleEvent(eventCh, c, appsv1Client)
-	c.Start()
+	if *enableDaemonset {
+		go watch(ctx, clientset.AppsV1().RESTClient(), "daemonsets", &appsv1.DaemonSet{}, c)
+	}
 
 	<-ctx.Done()
-	close(eventCh)
-
 	<-c.Stop().Done()
 }
 
-func watchResource[T Object](
+func watch(
 	ctx context.Context,
 	client rest.Interface,
 	resource string,
-	sampleObj T,
-	ch chan Event,
+	objType runtime.Object,
+	c *cron.Cron,
 ) {
-	listWatcher := cache.NewListWatchFromClient(client, resource, corev1.NamespaceAll, fields.Everything())
+	jobs := make(map[string]cron.EntryID)
 
-	_, informer := cache.NewIndexerInformer(listWatcher, sampleObj, 0, cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			if o, ok := obj.(T); ok {
-				if !validNamespace(o.GetNamespace()) || getSchedule(o) == "" {
-					return
-				}
+	add := func(she, key string, job func()) {
+		entryID, err := c.AddFunc(she, job)
+		if err != nil {
+			klog.ErrorS(err, "failed to add job", "resource", resource, "key", key)
+			return
+		}
 
-				ch <- Event{
-					obj:   o,
-					event: watch.Added,
-				}
+		jobs[key] = entryID
+		klog.InfoS("job added", "resource", resource, "key", key, "schedule", she)
+	}
+
+	remove := func(key string) {
+		if entryID, ok := jobs[key]; ok {
+			c.Remove(entryID)
+			delete(jobs, key)
+			klog.InfoS("job removed", "resource", resource, "key", key)
+		}
+	}
+
+	listWatch := cache.NewListWatchFromClient(client, resource, corev1.NamespaceAll, fields.Everything())
+	_, controller := cache.NewIndexerInformer(listWatch, objType, 0, cache.ResourceEventHandlerFuncs{
+		AddFunc: func(v interface{}) {
+			obj := v.(metav1.Object)
+
+			if she := getSchedule(obj); she != "" {
+				job := buildJob(client, resource, obj.GetNamespace(), obj.GetName())
+				add(she, getObjectKey(obj), job)
 			}
 		},
-		UpdateFunc: func(oldObj, newObj interface{}) {
-			if o, ok := newObj.(T); ok {
-				if !validNamespace(o.GetNamespace()) {
-					return
-				}
+		UpdateFunc: func(oldv, newv interface{}) {
+			oldObj := oldv.(metav1.Object)
+			newObj := newv.(metav1.Object)
 
-				if getSchedule(o) == "" {
-					if oo, ok := oldObj.(T); ok && getSchedule(oo) == "" {
-						return
-					}
-				}
+			if getSchedule(newObj) == getSchedule(oldObj) {
+				return
+			}
 
-				ch <- Event{
-					obj:   o,
-					event: watch.Modified,
-				}
+			if getSchedule(oldObj) != "" {
+				remove(getObjectKey(oldObj))
+			}
+
+			if she := getSchedule(newObj); she != "" {
+				job := buildJob(client, resource, newObj.GetNamespace(), newObj.GetName())
+				add(she, getObjectKey(newObj), job)
 			}
 		},
-		DeleteFunc: func(obj interface{}) {
-			if o, ok := obj.(T); ok {
-				if !validNamespace(o.GetNamespace()) || getSchedule(o) == "" {
-					return
-				}
-
-				ch <- Event{
-					obj:   o,
-					event: watch.Deleted,
-				}
-			}
+		DeleteFunc: func(v interface{}) {
+			remove(getObjectKey(v.(metav1.Object)))
 		},
 	}, cache.Indexers{})
 
-	resourcesMap[typeOf(sampleObj)] = resource
-	informer.Run(ctx.Done())
+	klog.Infof("watching %s", resource)
+	controller.Run(ctx.Done())
 }
 
-func handleEvent(ch chan Event, c *cron.Cron, rc rest.Interface) {
-	cronjobs := make(map[string]Cronjob)
-
-	for event := range ch {
-		ns := event.obj.GetNamespace()
-
-		name := event.obj.GetName()
-		objType := typeOf(event.obj)
-
-		cronkey := fmt.Sprintf("%s/%s/%s", objType, ns, name)
-		schedule := getSchedule(event.obj)
-
-		var (
-			needDelete, needAdd bool
-		)
-
-		switch event.event {
-		case watch.Added:
-			needAdd = true
-		case watch.Modified:
-			if rec, ok := cronjobs[cronkey]; ok {
-				if rec.schedule == schedule {
-					continue
-				}
-				needDelete = true
-			}
-
-			if schedule != "" {
-				needAdd = true
-			}
-		case watch.Deleted:
-			needDelete = true
-		}
-
-		if needDelete {
-			if rec, ok := cronjobs[cronkey]; ok {
-				c.Remove(rec.entryID)
-				delete(cronjobs, cronkey)
-				klog.InfoS("delete cronjob", "kind", objType, "ns", ns, "name", name)
-			}
-		}
-
-		if needAdd {
-			if rec, ok := cronjobs[cronkey]; ok {
-				if rec.schedule == schedule {
-					continue
-				}
-			}
-
-			entryID, err := c.AddFunc(schedule, func() {
-				patch := buildPodTemplateAnnotationsPatch(restartedAnnotation, time.Now().Format(time.RFC3339))
-				if err := patchObject(rc, resourcesMap[objType], ns, name, patch); err != nil {
-					klog.ErrorS(err, "patch error", "kind", objType, "ns", ns, "name", name)
-				} else {
-					klog.InfoS("patch succeeded", "kind", objType, "ns", ns, "name", name)
-				}
-			})
-
-			if err != nil {
-				klog.ErrorS(err, "add cronjob error", "kind", objType, "ns", ns, "name", name, "schedule", schedule)
-			} else {
-				cronjobs[cronkey] = Cronjob{
-					entryID:  entryID,
-					schedule: schedule,
-				}
-
-				klog.InfoS("add cronjob", "kind", objType, "ns", ns, "name", name, "schedule", schedule)
-			}
-		}
-	}
-}
-
-func makeKubeClient() (kubernetes.Interface, error) {
-	config, err := rest.InClusterConfig()
-
-	if err != nil {
-		kubeconfPath := os.Getenv("KUBECONFIG")
-		if kubeconfPath == "" {
-			kubeconfPath = os.Getenv("HOME") + "/.kube/config"
-		}
-		if err == rest.ErrNotInCluster {
-			config, err = clientcmd.BuildConfigFromFlags("", kubeconfPath)
-		}
-	}
-
-	if config == nil {
-		return nil, err
-	}
-
-	return kubernetes.NewForConfig(config)
-}
-
-func typeOf(o any) string {
-	return fmt.Sprintf("%T", o)
-}
-
-func patchObject(rc rest.Interface, resource, ns, name string, patch []byte) error {
-	return rc.Patch(types.MergePatchType).
-		Resource(resource).
-		Namespace(ns).
-		Name(name).
-		Body(patch).
-		VersionedParams(&metav1.PatchOptions{}, scheme.ParameterCodec).
-		Do(context.Background()).
-		Error()
-}
-
-func buildPodTemplateAnnotationsPatch(key, value string) []byte {
-	patch := fmt.Sprintf(`
+func buildJob(
+	client rest.Interface,
+	resource, namespace, name string,
+) func() {
+	return func() {
+		patch := fmt.Sprintf(`
 		{
 			"spec": {
 				"template": {
 					"metadata": {
 						"annotations": {
-							"%s":"%s"
+							"cron-restarter/restartedAt":"%s"
 						}
 					}
 				}
 			}
-		}`, key, value)
+		}`, time.Now().Format(time.RFC3339))
 
-	return []byte(patch)
+		err := client.Patch(types.MergePatchType).
+			Resource(resource).
+			Namespace(namespace).
+			Name(name).
+			Body([]byte(patch)).
+			VersionedParams(&metav1.PatchOptions{}, scheme.ParameterCodec).
+			Do(context.Background()).
+			Error()
+
+		if err != nil {
+			klog.ErrorS(err, "failed to patch object", "resource", resource, "namespace", namespace, "name", name)
+			return
+		}
+
+		klog.InfoS(
+			"resource restarted",
+			"resource", resource,
+			"namespace", namespace,
+			"name", name,
+		)
+	}
 }
 
-func getSchedule(o Object) string {
-	return o.GetAnnotations()[*cronScheduleAnnotation]
+func getObjectKey(object metav1.Object) string {
+	return object.GetNamespace() + "/" + object.GetName()
+}
+
+func getSchedule(object metav1.Object) string {
+	if annos := object.GetAnnotations(); annos != nil {
+		return annos[*cronScheduleAnnotation]
+	}
+
+	return ""
 }
