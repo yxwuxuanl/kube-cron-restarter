@@ -1,0 +1,14 @@
+apiVersion: v1
+entries:
+  kube-cron-restarter:
+  - apiVersion: v2
+    appVersion: 1.16.0
+    created: "2024-07-23T08:11:51.925976109Z"
+    description: A Helm chart for Kubernetes
+    digest: 3ddfb99982dee21a3330b963ab5ca7fce86bb51d1e8236e8492579f53236cfb1
+    name: kube-cron-restarter
+    type: application
+    urls:
+    - https://github.com/yxwuxuanl/kube-cron-restarter/releases/download/kube-cron-restarter-1.0.0/kube-cron-restarter-1.0.0.tgz
+    version: 1.0.0
+generated: "2024-07-23T08:11:51.926002809Z"
