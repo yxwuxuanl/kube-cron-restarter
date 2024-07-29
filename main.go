@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/signal"
 	"path"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -74,22 +75,32 @@ func watch(
 	objType runtime.Object,
 	c *cron.Cron,
 ) {
-	jobs := make(map[string]cron.EntryID)
+	jobs := make(map[string][]cron.EntryID)
 
 	add := func(she, key string, job func()) {
-		entryID, err := c.AddFunc(she, job)
-		if err != nil {
-			klog.ErrorS(err, "failed to add job", "resource", resource, "key", key)
-			return
-		}
+		for _, v := range strings.Split(she, ",") {
+			entryID, err := c.AddFunc(v, job)
+			if err != nil {
+				klog.ErrorS(
+					err, "failed to add job",
+					"resource", resource,
+					"key", key,
+					"schedule", v,
+				)
+				continue
+			}
 
-		jobs[key] = entryID
-		klog.InfoS("job added", "resource", resource, "key", key, "schedule", she)
+			jobs[key] = append(jobs[key], entryID)
+			klog.InfoS("job added", "resource", resource, "key", key, "schedule", v)
+		}
 	}
 
 	remove := func(key string) {
-		if entryID, ok := jobs[key]; ok {
-			c.Remove(entryID)
+		if entrys, ok := jobs[key]; ok {
+			for _, entryID := range entrys {
+				c.Remove(entryID)
+			}
+
 			delete(jobs, key)
 			klog.InfoS("job removed", "resource", resource, "key", key)
 		}
