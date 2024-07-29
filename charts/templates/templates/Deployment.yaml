@@ -25,6 +25,8 @@ spec:
         - name: {{ .Release.Name }}
           image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
           imagePullPolicy: {{ .Values.image.imagePullPolicy }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
           env:
             - name: TZ
               value: {{ .Values.timezone }}
@@ -33,6 +35,9 @@ spec:
             - --statefulsets={{ toString .Values.statefulset}}
             - --daemonsets={{ toString .Values.daemonset }}
             - --kubeconfig=
+            {{- with .Values.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           securityContext:
             capabilities:
               drop:

@@ -14,3 +14,13 @@ nodeSelector: { }
 tolerations: [ ]
 
 timezone: Asia/Shanghai
+
+extraArgs: [ ]
+
+resources:
+  requests:
+    cpu: '20m'
+    memory: 50Mi
+  limits:
+    cpu: '100m'
+    memory: 100Mi
